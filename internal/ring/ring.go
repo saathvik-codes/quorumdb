@@ -11,13 +11,17 @@ import (
 	"sync"
 )
 
-// HashRing maps keys to owning nodes via consistent hashing.
+// HashRing maps keys to owning nodes via consistent hashing, and is
+// topology-aware: PreferenceList spreads replicas across distinct zones
+// (racks/AZs) when enough zones are available, so a single zone failure
+// can't take out every replica of a key.
 type HashRing struct {
 	mu           sync.RWMutex
 	virtualNodes int
 	sortedHashes []uint64
 	hashToNode   map[uint64]string
 	nodes        map[string]bool
+	nodeZone     map[string]string
 }
 
 func New(virtualNodesPerNode int) *HashRing {
@@ -25,6 +29,7 @@ func New(virtualNodesPerNode int) *HashRing {
 		virtualNodes: virtualNodesPerNode,
 		hashToNode:   make(map[uint64]string),
 		nodes:        make(map[string]bool),
+		nodeZone:     make(map[string]string),
 	}
 }
 
@@ -33,8 +38,12 @@ func hashKey(key string) uint64 {
 	return binary.BigEndian.Uint64(sum[:8])
 }
 
-// AddNode registers a node and its virtual replicas on the ring.
-func (r *HashRing) AddNode(nodeID string) {
+// AddNode registers a node (and its virtual replicas) on the ring, tagged
+// with the failure domain (rack/AZ/zone) it lives in. An empty zone is
+// treated as its own singleton zone equal to the node ID, so placement
+// still works (degrading gracefully to "no topology info") if callers don't
+// supply one.
+func (r *HashRing) AddNode(nodeID, zone string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -42,6 +51,10 @@ func (r *HashRing) AddNode(nodeID string) {
 		return
 	}
 	r.nodes[nodeID] = true
+	if zone == "" {
+		zone = nodeID
+	}
+	r.nodeZone[nodeID] = zone
 
 	for i := 0; i < r.virtualNodes; i++ {
 		vKey := fmt.Sprintf("%s#%d", nodeID, i)
@@ -61,6 +74,7 @@ func (r *HashRing) RemoveNode(nodeID string) {
 		return
 	}
 	delete(r.nodes, nodeID)
+	delete(r.nodeZone, nodeID)
 
 	filtered := r.sortedHashes[:0]
 	for _, h := range r.sortedHashes {
@@ -73,8 +87,12 @@ func (r *HashRing) RemoveNode(nodeID string) {
 	r.sortedHashes = filtered
 }
 
-// PreferenceList returns the N distinct physical nodes responsible for key,
-// walking clockwise around the ring starting from key's hash position.
+// PreferenceList returns the N physical nodes responsible for key, walking
+// clockwise around the ring from key's hash position and preferring nodes
+// from zones not yet represented in the result — so with enough zones, N
+// replicas land in N distinct failure domains instead of clustering in one.
+// If there aren't enough distinct zones for N replicas, it falls back to
+// filling remaining slots from any unseen node regardless of zone.
 func (r *HashRing) PreferenceList(key string, n int) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -89,17 +107,40 @@ func (r *HashRing) PreferenceList(key string, n int) []string {
 		idx = 0
 	}
 
-	seen := make(map[string]bool)
+	seenNode := make(map[string]bool)
+	seenZone := make(map[string]bool)
 	var result []string
+	var fallback []string // unseen nodes whose zone was already used
+
 	for i := 0; i < len(r.sortedHashes) && len(result) < n; i++ {
 		pos := (idx + i) % len(r.sortedHashes)
 		node := r.hashToNode[r.sortedHashes[pos]]
-		if !seen[node] {
-			seen[node] = true
+		if seenNode[node] {
+			continue
+		}
+		zone := r.nodeZone[node]
+		if !seenZone[zone] {
+			seenNode[node] = true
+			seenZone[zone] = true
 			result = append(result, node)
+		} else if len(fallback) < n {
+			seenNode[node] = true
+			fallback = append(fallback, node)
 		}
 	}
+
+	for i := 0; len(result) < n && i < len(fallback); i++ {
+		result = append(result, fallback[i])
+	}
+
 	return result
+}
+
+// ZoneOf returns the failure-domain label for a node, or "" if unknown.
+func (r *HashRing) ZoneOf(nodeID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.nodeZone[nodeID]
 }
 
 func (r *HashRing) Nodes() []string {

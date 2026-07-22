@@ -24,6 +24,11 @@ type clientGetResponse struct {
 func (c *CoordinatorServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(c.Coord.Metrics.Render()))
+	})
+
 	mux.HandleFunc("/kv/", func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Path[len("/kv/"):]
 		if key == "" {
@@ -73,6 +78,7 @@ func (c *CoordinatorServer) Handler() http.Handler {
 			"replicationFactorN": c.Coord.N,
 			"writeQuorumW":       c.Coord.W,
 			"readQuorumR":        c.Coord.R,
+			"pendingHintsByNode": c.Coord.Hints.PendingByNode(),
 		})
 	})
 

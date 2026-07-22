@@ -1,0 +1,12 @@
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/node ./cmd/node
+
+FROM alpine:3.20
+RUN adduser -D -H quorumdb && mkdir -p /data && chown quorumdb:quorumdb /data
+COPY --from=build /out/node /usr/local/bin/node
+USER quorumdb
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/local/bin/node"]

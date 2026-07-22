@@ -1,5 +1,7 @@
 data/
+bin/
 *.exe
 /qdb-node
 /qdb-coordinator
 /qdb-bench
+/qdb-chaos

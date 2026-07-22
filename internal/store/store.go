@@ -1,8 +1,10 @@
 // Package store implements a single-node LSM-style storage engine:
 // writes go to a write-ahead log (durability) and an in-memory memtable
 // (speed); once the memtable crosses a size threshold it is flushed to an
-// immutable, key-sorted segment file on disk and reads fall through
-// memtable -> segments (newest first).
+// immutable, key-sorted segment file (with a bloom filter + sparse index)
+// on disk, and reads fall through memtable -> segments (newest first).
+// Compact() merges all segments into one, dropping tombstones and
+// superseded versions.
 package store
 
 import (
@@ -31,7 +33,7 @@ type Store struct {
 	flushAt      int
 	wal          *os.File
 	walEnc       *bufio.Writer
-	segments     []string // file paths, oldest first
+	segments     []*segmentHandle // oldest first
 	segCounter   int
 }
 
@@ -96,7 +98,7 @@ func (s *Store) write(key string, value []byte, ts int64, tombstone bool) error 
 		return nil
 	}
 
-	if err := appendWALRecord(s.walEnc, key, value, ts, tombstone); err != nil {
+	if err := writeRecord(s.walEnc, key, value, ts, tombstone); err != nil {
 		return err
 	}
 	if err := s.walEnc.Flush(); err != nil {
@@ -115,7 +117,7 @@ func (s *Store) write(key string, value []byte, ts int64, tombstone bool) error 
 }
 
 // Get returns the value and true if found and not deleted, false if absent
-// or tombstoned. It also returns the entry's timestamp for read-repair.
+// or tombstoned.
 func (s *Store) Get(key string) (Entry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -125,16 +127,24 @@ func (s *Store) Get(key string) (Entry, bool) {
 	}
 
 	for i := len(s.segments) - 1; i >= 0; i-- {
-		if e, found := readFromSegment(s.segments[i], key); found {
+		if e, found := s.segments[i].get(key); found {
 			return e, !e.Tombstone
 		}
 	}
 	return Entry{}, false
 }
 
+// SegmentCount reports how many on-disk segments currently exist (useful for
+// tests/metrics to observe flush and compaction behavior).
+func (s *Store) SegmentCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.segments)
+}
+
 func (s *Store) flushLocked() error {
 	s.segCounter++
-	segPath := filepath.Join(s.dir, fmt.Sprintf("segment-%05d.dat", s.segCounter))
+	segPath := segmentPath(s.dir, s.segCounter)
 
 	keys := make([]string, 0, len(s.memtable))
 	for k := range s.memtable {
@@ -142,40 +152,35 @@ func (s *Store) flushLocked() error {
 	}
 	sort.Strings(keys)
 
-	f, err := os.Create(segPath)
+	handle, err := writeSegment(segPath, keys, s.memtable)
 	if err != nil {
 		return err
 	}
-	w := bufio.NewWriter(f)
-	for _, k := range keys {
-		e := s.memtable[k]
-		if err := writeSegmentRecord(w, k, e); err != nil {
-			f.Close()
-			return err
-		}
-	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
 
-	s.segments = append(s.segments, segPath)
+	s.segments = append(s.segments, handle)
 	s.memtable = make(map[string]Entry)
 	s.memtableSize = 0
 
-	// Truncate the WAL: everything in it is now durable in a segment file.
-	if err := s.wal.Truncate(0); err != nil {
+	// Reset the WAL: everything in it is now durable in a segment file.
+	// Closing and recreating the file (rather than Truncate+Seek on the
+	// existing handle) avoids a Windows-specific "Access is denied" when
+	// truncating a file opened O_APPEND.
+	walPath := filepath.Join(s.dir, "wal.log")
+	if err := s.wal.Close(); err != nil {
 		return err
 	}
-	if _, err := s.wal.Seek(0, io.SeekStart); err != nil {
+	newWal, err := os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
+	s.wal = newWal
 	s.walEnc = bufio.NewWriter(s.wal)
 
 	return nil
+}
+
+func segmentPath(dir string, counter int) string {
+	return filepath.Join(dir, fmt.Sprintf("segment-%05d.dat", counter))
 }
 
 func (s *Store) loadSegmentList() error {
@@ -183,15 +188,22 @@ func (s *Store) loadSegmentList() error {
 	if err != nil {
 		return err
 	}
-	var segs []string
+	var paths []string
 	for _, e := range entries {
 		if !e.IsDir() && filepath.Ext(e.Name()) == ".dat" {
-			segs = append(segs, filepath.Join(s.dir, e.Name()))
+			paths = append(paths, filepath.Join(s.dir, e.Name()))
 		}
 	}
-	sort.Strings(segs) // segment-00001.dat < segment-00002.dat lexicographically
-	s.segments = segs
-	s.segCounter = len(segs)
+	sort.Strings(paths) // segment-00001.dat < segment-00002.dat lexicographically
+
+	for _, p := range paths {
+		handle, err := loadSegmentHandle(p)
+		if err != nil {
+			return fmt.Errorf("loading segment %s: %w", p, err)
+		}
+		s.segments = append(s.segments, handle)
+	}
+	s.segCounter = len(paths)
 	return nil
 }
 
@@ -208,12 +220,10 @@ func (s *Store) replayWAL() error {
 
 	r := bufio.NewReader(f)
 	for {
-		key, value, ts, tombstone, err := readWALRecord(r)
-		if err == io.EOF {
-			break
-		}
+		key, value, ts, tombstone, err := readRecord(r)
 		if err != nil {
-			// Truncated final record (crash mid-write) — stop replay here.
+			// EOF or a truncated final record (crash mid-write) — either way,
+			// replay stops here; a truncated record was never fsync'd as complete.
 			break
 		}
 		s.memtable[key] = Entry{Value: value, Timestamp: ts, Tombstone: tombstone}
@@ -222,14 +232,6 @@ func (s *Store) replayWAL() error {
 }
 
 // --- on-disk record format: [keyLen uint32][key][tombstone byte][ts int64][valueLen uint32][value] ---
-
-func appendWALRecord(w *bufio.Writer, key string, value []byte, ts int64, tombstone bool) error {
-	return writeRecord(w, key, value, ts, tombstone)
-}
-
-func writeSegmentRecord(w *bufio.Writer, key string, e Entry) error {
-	return writeRecord(w, key, e.Value, e.Timestamp, e.Tombstone)
-}
 
 func writeRecord(w *bufio.Writer, key string, value []byte, ts int64, tombstone bool) error {
 	var buf [4]byte
@@ -270,10 +272,6 @@ func writeRecord(w *bufio.Writer, key string, value []byte, ts int64, tombstone 
 	return nil
 }
 
-func readWALRecord(r *bufio.Reader) (key string, value []byte, ts int64, tombstone bool, err error) {
-	return readRecord(r)
-}
-
 func readRecord(r *bufio.Reader) (key string, value []byte, ts int64, tombstone bool, err error) {
 	var lenBuf [4]byte
 	if _, err = io.ReadFull(r, lenBuf[:]); err != nil {
@@ -310,25 +308,6 @@ func readRecord(r *bufio.Reader) (key string, value []byte, ts int64, tombstone 
 		}
 	}
 	return
-}
-
-func readFromSegment(path, targetKey string) (Entry, bool) {
-	f, err := os.Open(path)
-	if err != nil {
-		return Entry{}, false
-	}
-	defer f.Close()
-
-	r := bufio.NewReader(f)
-	for {
-		key, value, ts, tombstone, err := readRecord(r)
-		if err != nil {
-			return Entry{}, false
-		}
-		if key == targetKey {
-			return Entry{Value: value, Timestamp: ts, Tombstone: tombstone}, true
-		}
-	}
 }
 
 func Now() int64 {

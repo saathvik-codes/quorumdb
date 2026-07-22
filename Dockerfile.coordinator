@@ -1,0 +1,11 @@
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod ./
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/coordinator ./cmd/coordinator
+
+FROM alpine:3.20
+RUN adduser -D -H quorumdb
+COPY --from=build /out/coordinator /usr/local/bin/coordinator
+USER quorumdb
+ENTRYPOINT ["/usr/local/bin/coordinator"]

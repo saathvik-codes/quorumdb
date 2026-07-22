@@ -1,0 +1,48 @@
+services:
+  node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command: ["--id=node-1", "--addr=:9101", "--data=/data"]
+    volumes:
+      - node1-data:/data
+    expose: ["9101"]
+    ports: ["9101:9101"]
+
+  node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command: ["--id=node-2", "--addr=:9102", "--data=/data"]
+    volumes:
+      - node2-data:/data
+    expose: ["9102"]
+    ports: ["9102:9102"]
+
+  node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command: ["--id=node-3", "--addr=:9103", "--data=/data"]
+    volumes:
+      - node3-data:/data
+    expose: ["9103"]
+    ports: ["9103:9103"]
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    command:
+      - "--addr=:9000"
+      - "--nodes=node-1=http://node-1:9101=zone-a,node-2=http://node-2:9102=zone-b,node-3=http://node-3:9103=zone-c"
+      - "--n=3"
+      - "--w=2"
+      - "--r=2"
+    ports: ["9000:9000"]
+    depends_on: [node-1, node-2, node-3]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
