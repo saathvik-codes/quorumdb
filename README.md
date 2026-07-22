@@ -4,8 +4,19 @@ A miniature Bigtable/Dynamo/Cassandra-style distributed KV store in Go,
 built to demonstrate the actual mechanics of distributed storage systems —
 not a wrapper around one. No external database, no ORM, **zero third-party
 Go dependencies** (check `go.mod`): consistent hashing, quorum consensus,
-an LSM storage engine, bloom filters, hinted handoff, and metrics are all
-implemented directly.
+an LSM storage engine, bloom filters, hinted handoff, metrics, and a
+**from-scratch Raft consensus implementation** are all implemented directly.
+
+This repo ships **two independent replication strategies** over the same
+underlying LSM store, deliberately, to demonstrate the actual tradeoff
+rather than just picking one:
+
+| | Quorum + LWW (`cmd/node` + `cmd/coordinator`) | Raft (`cmd/raftnode`) |
+|---|---|---|
+| Consistency | Eventual (Dynamo-style) | Strong (linearizable writes) |
+| Availability | Any W of N nodes | Requires a live leader (majority) |
+| Conflict resolution | Last-write-wins by timestamp | None needed — total order via the log |
+| Best known for | Cassandra, DynamoDB | etcd, CockroachDB, TiKV |
 
 ## Architecture
 
@@ -47,7 +58,75 @@ implemented directly.
   read-repairs, pending hints, segment counts) in standard text-exposition
   format, hand-rolled with zero dependencies.
 
-## Run a 3-node cluster locally
+## Raft architecture (`internal/raft`, `internal/raftkv`, `cmd/raftnode`)
+
+```
+  client
+    |
+    v
+ node-1 (leader)  <---AppendEntries--->  node-2 (follower)
+    |         <---AppendEntries--->  node-3 (follower)
+    v
+  LSM store (applied only once Raft commits the entry)
+```
+
+Each `raftnode` is a full peer — there's no separate coordinator process;
+the current leader takes client writes directly. A full implementation of
+the algorithm from the paper ("In Search of an Understandable Consensus
+Algorithm", Ongaro & Ousterhout), not a library wrapper:
+
+- **Leader election** (`RequestVote`) — randomized election timeouts
+  (300-600ms) to avoid split votes, term-based safety (a node only grants
+  one vote per term, always defers to a higher term it observes), and the
+  log-completeness check (a candidate can't win without a log at least as
+  up-to-date as a majority of the cluster).
+- **Log replication** (`AppendEntries`) — the log-matching consistency
+  check with conflict-term backtracking (a follower whose log diverges
+  gets corrected in as few round-trips as possible, not one entry at a
+  time), and the commit rule that only commits entries from the *leader's
+  current term* by counting replicas (committing an older-term entry by
+  count alone is the classic Figure-8 safety violation the paper warns
+  about).
+- **Persistence** (`internal/raft/filestorage.go`) — currentTerm, votedFor,
+  and the log are durably saved (write-temp-then-atomic-rename) before a
+  node responds to any RPC that changes them; a restarted node reloads this
+  and cannot double-vote in a term it already voted in.
+- **State machine** (`internal/raftkv`) — commands are only applied to the
+  local LSM store once Raft has committed them, so every node's store
+  converges to the identical sequence of writes in the identical order.
+
+The algorithm is unit-tested against an **in-memory transport**
+(`internal/raft/memory_transport_test.go`) — direct function calls, no
+network — so the tests are fast and the failures they'd catch are actual
+algorithm bugs, not flaky timing:
+
+```
+go test ./internal/raft/... -v
+```
+
+## Run a 3-node Raft cluster locally
+
+```
+go build -o bin/raftnode ./cmd/raftnode
+
+./bin/raftnode --id=node-1 --addr=:9201 --peers="node-2=http://localhost:9202,node-3=http://localhost:9203" &
+./bin/raftnode --id=node-2 --addr=:9202 --peers="node-1=http://localhost:9201,node-3=http://localhost:9203" &
+./bin/raftnode --id=node-3 --addr=:9203 --peers="node-1=http://localhost:9201,node-2=http://localhost:9202" &
+```
+
+```
+curl http://localhost:9201/status              # {"role":"leader","term":1,"leaderId":"node-1"}
+curl -X PUT http://localhost:9201/kv/hello -d '{"value":"world"}'
+curl http://localhost:9202/kv/hello             # replicated to a follower's local store
+curl -X PUT http://localhost:9202/kv/x -d '{"value":"y"}'   # 421 "not leader", with leaderId hint
+```
+
+Kill the leader's process; watch a follower win a new election in a higher
+term within ~1-2s; writes keep working against the new leader; restart the
+old leader and it rejoins as a follower and catches up the log entries it
+missed — no data loss, no split-brain.
+
+## Run a 3-node cluster locally (quorum + LWW system)
 
 ```
 go build -o bin/node ./cmd/node
@@ -98,6 +177,32 @@ reads, **0 assertion failures**.
 
 ## Verified behavior (tested, not claimed)
 
+**Raft:**
+
+- **Algorithm correctness, unit-tested with an in-memory transport**: leader
+  election converges to exactly one leader; a committed entry is applied
+  identically on every node; killing the leader mid-cluster triggers
+  failover to a strictly higher term and the old leader steps down on
+  rejoining; a follower partitioned during 5 commits catches up its entire
+  log via AppendEntries backtracking on reconnect, in order; 5 independent
+  5-node clusters observed repeatedly for split-brain (none found) across
+  election cycles with randomized timing — run 4 times back-to-back with
+  zero flakes.
+- **Persistence, unit-tested**: currentTerm/votedFor/log round-trip through
+  disk exactly, and a freshly constructed `Node` reloads them correctly on
+  `Start()`.
+- **Live 3-process cluster, verified over real HTTP**: election settles to
+  one agreed-upon leader; a write via the leader replicates and is directly
+  confirmed present on both followers' own local stores (not just
+  acknowledged); a follower correctly rejects a write with `421` and the
+  live leader's ID; killing the leader's OS process triggers a real
+  election won by a follower in a higher term within ~2s; the new leader
+  accepts and replicates new writes; the crashed node, restarted, rejoins
+  as a follower recognizing the new term (does **not** think it's still
+  leader) and catches up the log entry it missed while dead.
+
+**Quorum + LWW:**
+
 - **Replication is real**: a PUT lands on all N physical nodes with matching
   timestamps, confirmed by querying each node's internal API directly.
 - **Zone-aware placement is real**: with 3 distinct zones and N=3, every
@@ -127,10 +232,24 @@ reads, **0 assertion failures**.
 This demonstrates real distributed-systems mechanics, not a production
 deployment:
 
-- **No Raft/Paxos consensus** — replication uses quorum + last-write-wins,
-  not a replicated log with leader election. This is the single biggest
-  gap versus etcd/CockroachDB/TiKV-grade systems (see project notes for the
-  planned follow-up).
+**Raft:**
+
+- **No read-index/lease-read protocol** — `Get` answers directly from the
+  leader's local store rather than confirming current leadership first via
+  a heartbeat round-trip. In a vanishingly small window (microseconds,
+  right after losing leadership but before the node itself knows it) this
+  could serve a barely-stale read. A production implementation closes this
+  gap; it's called out explicitly rather than silently glossed over.
+- **No log compaction/snapshotting** — the log grows forever; a
+  long-running cluster would need periodic snapshots the way etcd/Raft
+  implementations truncate their log after a snapshot.
+- **No cluster membership changes** (adding/removing a peer) — the peer set
+  is fixed at process start via `--peers`.
+- JSON re-serializes the whole log on every persisted write (see
+  `filestorage.go`) rather than an append-only persistent log format.
+
+**Quorum + LWW:**
+
 - **Hints are held in the coordinator's memory**, not durably on another
   live node — a coordinator crash drops in-flight hints (the underlying
   data isn't lost; it relies on the W replicas that did succeed plus

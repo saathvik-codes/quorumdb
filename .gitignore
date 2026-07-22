@@ -1,4 +1,5 @@
 data/
+data-raft/
 bin/
 *.exe
 /qdb-node
