@@ -1,0 +1,5 @@
+data/
+*.exe
+/qdb-node
+/qdb-coordinator
+/qdb-bench
